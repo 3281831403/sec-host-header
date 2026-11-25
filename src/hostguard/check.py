@@ -18,6 +18,28 @@ _HOST_RE = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 )
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+_KNOWN_PROBLEM_CODES = {
+    "missing-host",
+    "invalid-host",
+    "invalid-port",
+    "host-userinfo",
+    "host-path",
+}
+
+
+def _parse_port(port_text: str | None) -> int | None:
+    """Validate a textual port; ``None`` means no port was supplied."""
+    if port_text is None:
+        return None
+    if not port_text or not port_text.isdigit():
+        raise ValueError("invalid-port")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError("invalid-port")
+    return port
+
 
 def parse_host(value: str) -> dict:
     """Parse a Host header value into a host and an optional port."""
@@ -30,210 +52,245 @@ def parse_host(value: str) -> dict:
         raise ValueError("invalid-host")
     if any(ch in " ,\\" for ch in text):
         raise ValueError("invalid-host")
+    # Userinfo and path components must never appear in a Host header.
     if "@" in text:
-        return {"host": text.lower(), "port": None}
+        raise ValueError("host-userinfo")
     if "/" in text:
-        text = text.split("/", 1)[0]
+        raise ValueError("host-path")
     if "?" in text or "#" in text:
         raise ValueError("invalid-host")
 
     if text.startswith("["):
         end = text.find("]")
-        if end < 0:
+        if end <= 1:
             raise ValueError("invalid-host")
         host = text[: end + 1]
         tail = text[end + 1 :]
-        if tail:
-            if not tail.startswith(":"):
-                raise ValueError("invalid-host")
+        if tail == "":
+            port_text = None
+        elif tail.startswith(":"):
             port_text = tail[1:]
         else:
-            port_text = None
+            raise ValueError("invalid-host")
+        literal = host[1:-1]
+        if "%" in literal:
+            raise ValueError("invalid-host")
         try:
-            ipaddress.IPv6Address(host[1:-1])
+            ipaddress.IPv6Address(literal)
         except ValueError:
             raise ValueError("invalid-host") from None
-    else:
-        if text.count(":") > 1:
-            raise ValueError("invalid-host")
-        if ":" in text:
-            host, port_text = text.rsplit(":", 1)
-        else:
-            host, port_text = text, None
-        if not _HOST_RE.fullmatch(host.lower()):
-            raise ValueError("invalid-host")
+        port = _parse_port(port_text)
+        return {"host": host.lower(), "port": port}
 
-    if port_text is None:
-        return {"host": host.lower(), "port": None}
-    if not port_text.isdigit():
-        raise ValueError("invalid-port")
-    port = int(port_text)
+    if text.count(":") > 1:
+        raise ValueError("invalid-host")
+    if ":" in text:
+        host, port_text = text.rsplit(":", 1)
+    else:
+        host, port_text = text, None
+
+    # A single trailing dot (FQDN form) is accepted and dropped; more than
+    # one trailing dot is not a valid hostname.
+    if host.endswith("."):
+        host = host[:-1]
+        if not host or host.endswith("."):
+            raise ValueError("invalid-host")
+    if not _HOST_RE.fullmatch(host.lower()):
+        raise ValueError("invalid-host")
+    port = _parse_port(port_text)
     return {"host": host.lower(), "port": port}
 
 
 def normalize_host(host: str, port: int | None, scheme: str) -> str:
-    """Return a lowercase authority suitable for comparisons and links."""
+    """Return a lowercase authority suitable for comparisons and links.
+
+    Default ports for the scheme are removed so that, e.g. ``example.com:443``
+    over HTTPS normalizes to the same authority as ``example.com``.
+    """
     name = str(host).strip().lower().rstrip(".")
-    if port is None or str(port).strip() == "":
+    if not name.startswith("[") and ":" in name:
+        # Bare IPv6 literal supplied without brackets.
+        name = f"[{name}]"
+    if port is None or (isinstance(port, str) and not str(port).strip()):
         return name
     number = int(port)
+    if _DEFAULT_PORTS.get(str(scheme).strip().lower()) == number:
+        return name
     return f"{name}:{number}"
 
 
 def allowlisted(host: str, allowlist: list[str]) -> bool:
-    """Return whether the host is explicitly present in the allowlist."""
-    candidate = str(host).strip().rstrip(".")
+    """Return whether the host is explicitly present in the allowlist.
+
+    Comparison is case-insensitive but otherwise exact: suffix/prefix
+    matching would let ``evil-example.com`` pass for ``example.com``.
+    """
+    candidate = str(host).strip().lower().rstrip(".")
     for item in allowlist or []:
-        entry = str(item).strip().rstrip(".")
-        if not entry:
-            continue
-        if candidate == entry or candidate.endswith(entry):
+        entry = str(item).strip().lower().rstrip(".")
+        if entry and candidate == entry:
             return True
     return False
 
 
+def _find_absolute_token(text: Any) -> str | None:
+    """Return the whitespace-delimited token holding an absolute URI."""
+    if not isinstance(text, str) or "://" not in text:
+        return None
+    parts = text.split()
+    for token in parts:
+        if "://" in token:
+            return token
+    return text
+
+
+def _split_absolute_uri(token: str) -> tuple[str, str, str] | None:
+    """Split ``scheme://authority/path?query`` into its three parts."""
+    pos = token.find("://")
+    if pos <= 0:
+        return None
+    scheme = token[:pos].strip().lower()
+    rest = token[pos + 3 :]
+    cut = len(rest)
+    for separator in ("/", "?", "#"):
+        index = rest.find(separator)
+        if 0 <= index < cut:
+            cut = index
+    return scheme, rest[:cut], rest[cut:]
+
+
 def check_absolute_uri(request_line: str, host_header: str) -> bool:
     """Check whether an absolute request target agrees with the Host header."""
-    line = str(request_line).strip()
-    parts = line.split()
-    if not parts:
-        return False
-    if len(parts) >= 2 and "://" in parts[1]:
-        target = parts[1]
-    elif "://" in parts[0]:
-        target = parts[0]
-    else:
+    line = "" if request_line is None else str(request_line).strip()
+    token = _find_absolute_token(line)
+    if token is None:
+        # Origin-form (or asterisk/authority form): nothing to compare.
         return True
-    return bool(str(host_header).strip())
+    parsed = _split_absolute_uri(token)
+    if parsed is None:
+        return False
+    scheme, authority, _path = parsed
+    if "@" in authority:
+        # Tolerate userinfo in the request target by taking the actual host;
+        # the Host header itself is still parsed strictly elsewhere.
+        authority = authority.rsplit("@", 1)[1]
+    try:
+        target_authority = parse_host(authority)
+        header_authority = parse_host(str(host_header).strip(" \t"))
+    except ValueError:
+        return False
+    return normalize_host(
+        target_authority["host"], target_authority["port"], scheme
+    ) == normalize_host(
+        header_authority["host"], header_authority["port"], scheme
+    )
+
+
+def _collect_host_values(headers: Any) -> list[str]:
+    """Collect every Host header value, in order, preserving duplicates."""
+    values: list[str] = []
+    if isinstance(headers, Mapping):
+        for name, raw in headers.items():
+            if str(name).strip().lower() != "host":
+                continue
+            if isinstance(raw, str):
+                values.append(raw.strip(" \t"))
+            else:
+                try:
+                    items = list(raw)
+                except TypeError:
+                    values.append(str(raw).strip(" \t"))
+                else:
+                    values.extend(str(item).strip(" \t") for item in items)
+    elif headers is not None:
+        for item in headers:
+            if isinstance(item, str):
+                if ":" not in item:
+                    continue
+                name, value = item.split(":", 1)
+            else:
+                try:
+                    name, value = item
+                except (TypeError, ValueError):
+                    continue
+            if str(name).strip().lower() == "host":
+                values.append(str(value).strip(" \t"))
+    return values
 
 
 def check_duplicates(headers: Any) -> bool:
     """Return whether more than one Host header is present."""
-    count = 0
-    if isinstance(headers, Mapping):
-        for name, values in headers.items():
-            if str(name).strip().lower() != "host":
-                continue
-            if isinstance(values, str):
-                occurrences = 1
-            else:
-                try:
-                    occurrences = len(values)
-                except TypeError:
-                    occurrences = 1
-            for _ in range(occurrences):
-                if count == 0:
-                    count = 1
-    else:
-        for item in headers or []:
-            if isinstance(item, str):
-                if ":" not in item:
-                    continue
-                name, _value = item.split(":", 1)
-            else:
-                try:
-                    name, _value = item
-                except (TypeError, ValueError):
-                    continue
-            if str(name).strip().lower() != "host":
-                continue
-            if count == 0:
-                count = 1
-    return count > 1
+    return len(_collect_host_values(headers)) > 1
+
+
+def _select_scheme(scheme: Any, request: Any) -> str:
+    """Pick the scheme from the explicit argument or the request field."""
+    if scheme is not None and str(scheme).strip():
+        return str(scheme).strip().lower()
+    request_scheme = request.get("scheme")
+    if request_scheme is not None and str(request_scheme).strip():
+        return str(request_scheme).strip().lower()
+    return "https"
 
 
 def build_url(request: Any, scheme: str) -> str:
-    """Build an external URL whose authority comes from the Host header."""
-    headers = request.get("headers")
-    host_values = []
-    if isinstance(headers, Mapping):
-        for name, values in headers.items():
-            if str(name).strip().lower() != "host":
-                continue
-            if isinstance(values, str):
-                host_values.append(values)
-            else:
-                host_values.extend(str(item) for item in values)
-    elif headers is not None:
-        for item in headers:
-            if isinstance(item, str):
-                if ":" not in item:
-                    continue
-                name, value = item.split(":", 1)
-            else:
-                try:
-                    name, value = item
-                except (TypeError, ValueError):
-                    continue
-            if str(name).strip().lower() == "host":
-                host_values.append(str(value).strip(" \t"))
+    """Build an external URL whose authority comes from a validated Host."""
+    host_values = _collect_host_values(request.get("headers"))
+    if len(host_values) > 1:
+        raise ValueError("duplicate-host")
     if not host_values:
-        host_values = [str(request.get("host") or "example.com")]
+        direct_host = request.get("host")
+        if direct_host is not None and str(direct_host).strip(" \t"):
+            host_values.append(str(direct_host).strip(" \t"))
+    if not host_values:
+        raise ValueError("missing-host")
 
-    raw_host = str(host_values[0]).strip(" \t")
-    check_host = raw_host.split("@", 1)[0].split(":", 1)[0]
-    if not allowlisted(check_host, request.get("allowlist", [])):
+    raw_host = host_values[0]
+    # Strict parsing rejects userinfo, paths and invalid ports.
+    parsed = parse_host(raw_host)
+    if not allowlisted(parsed["host"], request.get("allowlist", [])):
         raise ValueError("host-not-allowlisted")
 
-    target = request.get("target") or request.get("path") or "/"
-    path = str(target)
-    if "://" in path:
-        remainder = path.split("://", 1)[1]
-        cut = remainder.find("/")
-        path = remainder[cut:] if cut >= 0 else "/"
+    chosen_scheme = _select_scheme(scheme, request)
+    target = str(request.get("target") or request.get("path") or "/")
+    token = _find_absolute_token(target)
+    if token is not None:
+        if not check_absolute_uri(target, raw_host):
+            raise ValueError("absolute-uri-mismatch")
+        split = _split_absolute_uri(token)
+        path = split[2] if split and split[2] else "/"
+    else:
+        path = target
     if not path.startswith("/"):
         path = "/" + path
-    return f"{str(scheme).strip().lower()}://{raw_host}{path}"
+
+    authority = normalize_host(parsed["host"], parsed["port"], chosen_scheme)
+    return f"{chosen_scheme}://{authority}{path}"
 
 
 def validate_request(request: Any) -> list[str]:
     """Return the problems found while validating one request."""
-    problems = []
+    problems: list[str] = []
     headers = request.get("headers")
-    if headers is not None and check_duplicates(headers):
+    host_values = _collect_host_values(headers)
+    if len(host_values) > 1:
         problems.append("duplicate-host")
 
-    host_values = []
-    if isinstance(headers, Mapping):
-        for name, values in headers.items():
-            if str(name).strip().lower() != "host":
-                continue
-            if isinstance(values, str):
-                host_values.append(values)
-            else:
-                host_values.extend(str(item) for item in values)
-    elif headers is not None:
-        for item in headers:
-            if isinstance(item, str):
-                if ":" not in item:
-                    continue
-                name, value = item.split(":", 1)
-            else:
-                try:
-                    name, value = item
-                except (TypeError, ValueError):
-                    continue
-            if str(name).strip().lower() == "host":
-                host_values.append(str(value).strip(" \t"))
     if not host_values:
         direct_host = request.get("host")
-        if direct_host is not None:
-            host_values.append(str(direct_host))
+        if direct_host is not None and str(direct_host).strip(" \t"):
+            host_values.append(str(direct_host).strip(" \t"))
     if not host_values:
-        host_values = [str(request.get("server_name") or "example.com")]
+        # HTTP/1.1 requires a Host header; never invent a default.
+        problems.append("missing-host")
+        return problems
 
-    raw_host = str(host_values[0]).strip(" \t")
+    raw_host = host_values[0]
     try:
         parsed = parse_host(raw_host)
     except ValueError as exc:
         code = str(exc)
-        if code not in {
-            "missing-host",
-            "invalid-host",
-            "invalid-port",
-            "host-userinfo",
-            "host-path",
-        }:
+        if code not in _KNOWN_PROBLEM_CODES:
             code = "invalid-host"
         problems.append(code)
         return problems
@@ -243,53 +300,15 @@ def validate_request(request: Any) -> list[str]:
 
     target = request.get("target") or request.get("request_line") or ""
     if isinstance(target, str) and "://" in target:
-        line = target
-        if not re.match(r"^[A-Za-z]+ ", line):
-            line = "GET " + line + " HTTP/1.1"
-        if not check_absolute_uri(line, raw_host):
+        if not check_absolute_uri(target, raw_host):
             problems.append("absolute-uri-mismatch")
     return problems
 
 
 def host_batch(requests: Any) -> dict:
-    """Validate a sequence of independent requests."""
-    results = {}
-    first_host = None
-    for index, request in enumerate(requests):
-        if index == 0:
-            headers = request.get("headers")
-            if isinstance(headers, Mapping):
-                for name, values in headers.items():
-                    if str(name).strip().lower() != "host":
-                        continue
-                    if isinstance(values, str):
-                        first_host = values
-                    else:
-                        values = list(values)
-                        if values:
-                            first_host = str(values[0])
-                    break
-            elif headers:
-                for item in headers:
-                    if isinstance(item, str):
-                        if ":" not in item:
-                            continue
-                        name, value = item.split(":", 1)
-                    else:
-                        try:
-                            name, value = item
-                        except (TypeError, ValueError):
-                            continue
-                    if str(name).strip().lower() == "host":
-                        first_host = str(value).strip(" \t")
-                        break
-            if first_host is None and request.get("host") is not None:
-                first_host = str(request["host"])
-            results[index] = validate_request(request)
-        else:
-            current = dict(request)
-            if first_host is not None:
-                current["headers"] = [("Host", first_host)]
-                current.pop("host", None)
-            results[index] = validate_request(current)
-    return results
+    """Validate a sequence of independent requests.
+
+    Each request is validated on its own merits; no host value is shared
+    between requests.
+    """
+    return {index: validate_request(request) for index, request in enumerate(requests)}
